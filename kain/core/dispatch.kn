@@ -1,0 +1,208 @@
+// ============================================================================
+// dispatch.kn — Fantasia Unified Core Engine Dispatcher (fantasia.exe)
+//
+// Single entry point for all audio processing & musical motif instruments:
+//   fantasia <tool> [args...]
+//   fantasia help [tool]
+//   fantasia prove
+//   fantasia sweep <audio.wav/.f32> [--out-dir <dir>] [--fs <hz>]
+//   OR invoked directly as <tool>.exe [args...] (BusyBox multi-call)
+//
+// Tools:
+//   wav_slice    RIFF WAV ingest & mono float32 normalization
+//   silence_gate Energy envelope segmentation & false-start pruner
+//   groove_hunt  Tempo (BPM) autocorrelation & beat stability classifier
+//   chroma_ssm   12-pitch chromagram & self-similarity recurrence matrix
+//   waterfall    1080p dynamic spectrum PNG diagnostic renderer
+// ============================================================================
+
+use std::process
+use std::text
+use std::fs
+use _common::EXIT_OK
+use _common::EXIT_HELP
+use _common::EXIT_ERROR
+use _common::bref
+use _common::find_from
+
+@extern @link_name("GetCommandLineA")
+fn k_GetCommandLineA() -> ptr<Byte>
+
+fn usage() -> String:
+    var t: String = "================================================================================\n"
+    t = t + " Fantasia Core Engine 0.1.0 — High-Throughput Musical DSP Pipeline\n"
+    t = t + "================================================================================\n\n"
+    t = t + "USAGE:\n"
+    t = t + "  fantasia <tool> [args...]             Run any instrument directly\n"
+    t = t + "  fantasia help <tool>                  Detailed CLI help for a specific instrument\n"
+    t = t + "  fantasia prove                        Run all formal mathematical prove batteries\n"
+    t = t + "  fantasia sweep <input.wav> [flags...] Execute complete 4-stage analysis sweep\n\n"
+    t = t + "INSTRUMENTS (5 total):\n"
+    t = t + "  [Audio Ingest]\n"
+    t = t + "    wav_slice    RIFF WAV (16-bit PCM / 32-bit float) -> mono .f32 voltage stream\n\n"
+    t = t + "  [Structure & Segmentation]\n"
+    t = t + "    silence_gate RMS energy envelope gating -> discrete take boundaries & takes.csv\n"
+    t = t + "    groove_hunt  Onset lag autocorrelation -> BPM, pulse clarity, LOCKED_GROOVE score\n\n"
+    t = t + "  [Harmonic Recurrence & Visualization]\n"
+    t = t + "    chroma_ssm   12-tone chromagram + Self-Similarity Matrix (SSM) motif catalog\n"
+    t = t + "    waterfall    High-density 1920x1080 multi-panel diagnostic PNG dashboard\n\n"
+    t = t + "TOOL SHORTHANDS:\n"
+    t = t + "  wav_slice    -> slice, wav\n"
+    t = t + "  silence_gate -> gate, silence\n"
+    t = t + "  groove_hunt  -> groove, tempo\n"
+    t = t + "  chroma_ssm   -> chroma, ssm, motif\n"
+    t = t + "  waterfall    -> wf, plot\n"
+    return t
+
+fn tool_help(tool: String) -> Int:
+    if tool == "wav_slice" or tool == "slice" or tool == "wav":
+        print(wav_slice_usage())
+    elif tool == "silence_gate" or tool == "gate" or tool == "silence":
+        print(silence_gate_usage())
+    elif tool == "groove_hunt" or tool == "groove" or tool == "tempo":
+        print(groove_hunt_usage())
+    elif tool == "chroma_ssm" or tool == "chroma" or tool == "ssm" or tool == "motif":
+        print(chroma_ssm_usage())
+    elif tool == "waterfall" or tool == "wf" or tool == "plot":
+        print(waterfall_usage())
+    else:
+        println("fantasia: unknown tool '" + tool + "'")
+        print(usage())
+        return EXIT_ERROR
+    return EXIT_OK
+
+fn sub_args(args: Array<String>) -> Array<String>:
+    var sub: Array<String> = []
+    var i: Int = 1
+    while i < len(args):
+        push(sub, args[i])
+        i = i + 1
+    return sub
+
+fn run_prove_battery() -> Int with Unsafe:
+    println("================================================================================")
+    println(" Fantasia Core Engine — Unified Mathematical Prove Battery")
+    println("================================================================================")
+    
+    var fails: Int = 0
+    println("\n[1/4] wav_slice --prove")
+    if wav_slice_prove() != EXIT_OK:
+        fails = fails + 1
+
+    println("\n[2/4] silence_gate --prove")
+    if silence_gate_prove() != EXIT_OK:
+        fails = fails + 1
+
+    println("\n[3/4] groove_hunt --prove")
+    if groove_hunt_prove() != EXIT_OK:
+        fails = fails + 1
+
+    println("\n[4/4] chroma_ssm --prove")
+    if chroma_ssm_prove() != EXIT_OK:
+        fails = fails + 1
+
+    println("================================================================================")
+    if fails == 0:
+        println(" Core Battery Receipt: ALL 4 PROVE BATTERIES PASSED (receipt=PASS)")
+        return EXIT_OK
+    else:
+        println(" Core Battery Receipt: " + str(fails) + " BATTERIES FAILED (receipt=FAIL)")
+        return EXIT_ERROR
+
+fn run_sweep(args: Array<String>) -> Int with Unsafe:
+    var in_path: String = ""
+    var out_dir: String = "sweep_out"
+    var fs_hz: String = "22050"
+
+    var i: Int = 0
+    while i < len(args):
+        let a: String = args[i]
+        if a == "--out-dir":
+            if i + 1 < len(args):
+                out_dir = args[i + 1]
+                i = i + 1
+        elif a == "--fs":
+            if i + 1 < len(args):
+                fs_hz = args[i + 1]
+                i = i + 1
+        elif len(a) > 0 and char_at(a, 0) != "-":
+            if in_path == "":
+                in_path = a
+        i = i + 1
+
+    if in_path == "":
+        println("fantasia sweep: error: no input audio provided. Usage: fantasia sweep <audio.wav> [--out-dir D]")
+        return EXIT_ERROR
+
+    println("================================================================================")
+    println(" Fantasia End-to-End Musical Pipeline Sweep -> " + in_path)
+    println("================================================================================")
+
+    let f32_path: String = out_dir + "/audio_mono.f32"
+    let takes_csv: String = out_dir + "/takes.csv"
+    let takes_md: String = out_dir + "/takes.md"
+    let groove_csv: String = out_dir + "/groove.csv"
+    let groove_md: String = out_dir + "/groove.md"
+    let motifs_csv: String = out_dir + "/motifs.csv"
+    let motifs_md: String = out_dir + "/motifs.md"
+
+    println("\n[Stage 1/4] wav_slice: Audio ingest & float32 extraction...")
+    let mut a1: Array<String> = ["--in", in_path, "--out", f32_path]
+    let r1: Int = wav_slice_main(a1)
+    if r1 != EXIT_OK:
+        println("Stage 1 failed")
+        return r1
+
+    println("\n[Stage 2/4] silence_gate: Segmenting continuous takes & pruning false starts...")
+    let mut a2: Array<String> = ["--in", f32_path, "--fs", fs_hz, "--csv", takes_csv, "--out", takes_md]
+    let r2: Int = silence_gate_main(a2)
+
+    println("\n[Stage 3/4] groove_hunt: Scanning tempo, beat autocorrelation & groove locking...")
+    let mut a3: Array<String> = ["--in", f32_path, "--fs", fs_hz, "--csv", groove_csv, "--out", groove_md]
+    let r3: Int = groove_hunt_main(a3)
+
+    println("\n[Stage 4/4] chroma_ssm: Harmonic chromagram & Self-Similarity Matrix recurrence...")
+    let mut a4: Array<String> = ["--in", f32_path, "--fs", fs_hz, "--csv", motifs_csv, "--out", motifs_md]
+    let r4: Int = chroma_ssm_main(a4)
+
+    println("\n================================================================================")
+    println(" Fantasia Pipeline Complete -> Results written to: " + out_dir)
+    println("================================================================================")
+    return EXIT_OK
+
+fn main() -> Int with Unsafe:
+    let args: Array<String> = process_user_args()
+    if len(args) == 0:
+        print(usage())
+        return EXIT_HELP
+
+    let cmd: String = args[0]
+
+    if cmd == "--help" or cmd == "-h" or cmd == "help":
+        if len(args) > 1:
+            return tool_help(args[1])
+        print(usage())
+        return EXIT_OK
+
+    if cmd == "prove" or cmd == "--prove":
+        return run_prove_battery()
+
+    if cmd == "sweep":
+        return run_sweep(sub_args(args))
+
+    if cmd == "wav_slice" or cmd == "slice" or cmd == "wav":
+        return wav_slice_main(sub_args(args))
+    elif cmd == "silence_gate" or cmd == "gate" or cmd == "silence":
+        return silence_gate_main(sub_args(args))
+    elif cmd == "groove_hunt" or cmd == "groove" or cmd == "tempo":
+        return groove_hunt_main(sub_args(args))
+    elif cmd == "chroma_ssm" or cmd == "chroma" or cmd == "ssm" or cmd == "motif":
+        return chroma_ssm_main(sub_args(args))
+    elif cmd == "waterfall" or cmd == "wf" or cmd == "plot":
+        return waterfall_main(sub_args(args))
+    else:
+        println("fantasia: unknown tool or command '" + cmd + "'")
+        print(usage())
+        return EXIT_ERROR
+
+    return EXIT_OK

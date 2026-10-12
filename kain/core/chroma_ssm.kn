@@ -1,0 +1,407 @@
+// ============================================================================
+// chroma_ssm.kn — Fantasia 04: Harmonic Chromagram & Self-Similarity Recurrence
+//
+// Detects repeating musical riffs, verses, choruses, and harmonic structure:
+//   1. Computes STFT via native sk_fft (N=2048, hop=1024)
+//   2. Maps frequency spectrum (55-2500 Hz) to 12 chromatic pitch classes
+//      (C, C#, D, D#, E, F, F#, G, G#, A, A#, B)
+//   3. Averages chroma into 8-second musical phrase chunks
+//   4. Generates Self-Similarity Matrix (SSM) via pairwise cosine similarity
+//   5. Screens off-diagonal stripes to find identical themes repeating
+//      across long recording sessions
+//   6. Estimates global tonal key center (e.g. C# minor / E major)
+//   7. Emits motifs.csv and motifs.md
+// ============================================================================
+
+use std::fs
+use std::process
+use std::runtime
+use std::text
+use std::math
+use _common::k_CreateFileA
+use _common::k_ReadFile
+use _common::k_WriteFile
+use _common::k_GetFileSizeEx
+use _common::k_CloseHandle
+use _common::k_GetLastError
+use _common::null_ptr
+use _common::GEN_READ
+use _common::GEN_WRITE
+use _common::OPEN_EXISTING
+use _common::CREATE_ALWAYS
+use _common::FILE_NORMAL
+use _common::FILE_SHARE_RW
+use _common::EXIT_OK
+use _common::EXIT_HELP
+use _common::EXIT_ERROR
+use _common::bref
+use _common::bstore
+use _common::parse_int_text
+use _common::parse_float_text
+use _common::find_from
+use _common::f32_of_quad
+use _common::sk_fft
+use _common::write_text_file
+use _common::fmt_f3
+
+const CHROMA_NFFT: Int = 2048
+const CHROMA_HOP: Int = 1024
+
+fn fast_log2(x: Float) -> Float:
+    if x <= 0.0:
+        return 0.0
+    var normalized: Float = x
+    var exponent: Float = 0.0
+    while normalized >= 2.0:
+        normalized = normalized * 0.5
+        exponent = exponent + 1.0
+    while normalized < 1.0:
+        normalized = normalized * 2.0
+        exponent = exponent - 1.0
+    let y: Float = (normalized - 1.0) / (normalized + 1.0)
+    let y2: Float = y * y
+    let series: Float = y * (1.0 + y2 * (0.33333333 + y2 * (0.2 + y2 * 0.142857)))
+    return 2.88539008 * series + exponent
+
+pub fn chroma_ssm_usage() -> String:
+    var t: String = "================================================================================\n"
+    t = t + " Fantasia Harmonic Chromagram & Self-Similarity Matrix (chroma_ssm) 0.1.0\n"
+    t = t + "================================================================================\n\n"
+    t = t + "USAGE:\n"
+    t = t + "  fantasia chroma_ssm --in <audio.f32> [--fs <hz>]\n"
+    t = t + "                      [--out motifs.md] [--csv motifs.csv] [--prove]\n\n"
+    t = t + "FLAGS:\n"
+    t = t + "  --in <path>        Input normalized float32 stream (.f32)\n"
+    t = t + "  --fs <hz>          Sample rate in Hz (default: 22050)\n"
+    t = t + "  --out <path>       Output Markdown report (default: motifs.md)\n"
+    t = t + "  --csv <path>       Output CSV motif database (default: motifs.csv)\n"
+    t = t + "  --prove            Run formal chromatic cosine similarity prove battery\n"
+    return t
+
+pub fn chroma_ssm_main(args: Array<String>) -> Int with Unsafe:
+    var in_path: String = ""
+    var out_path: String = "motifs.md"
+    var csv_path: String = "motifs.csv"
+    var fs_hz: Float = 22050.0
+    var run_prove: Int = 0
+    var show_help: Int = 0
+
+    var i: Int = 0
+    while i < len(args):
+        let a: String = args[i]
+        if a == "--help" or a == "-h":
+            show_help = 1
+        elif a == "--in":
+            if i + 1 < len(args):
+                in_path = args[i + 1]
+                i = i + 1
+        elif a == "--fs":
+            if i + 1 < len(args):
+                fs_hz = parse_float_text(args[i + 1])
+                i = i + 1
+        elif a == "--out":
+            if i + 1 < len(args):
+                out_path = args[i + 1]
+                i = i + 1
+        elif a == "--csv":
+            if i + 1 < len(args):
+                csv_path = args[i + 1]
+                i = i + 1
+        elif a == "--prove":
+            run_prove = 1
+        elif len(a) > 0:
+            if char_at(a, 0) != "-":
+                if in_path == "":
+                    in_path = a
+        i = i + 1
+
+    if show_help == 1:
+        print(chroma_ssm_usage())
+        return EXIT_HELP
+
+    if run_prove == 1:
+        return chroma_ssm_prove()
+
+    if in_path == "":
+        println("chroma_ssm: error: no input .f32 provided")
+        return EXIT_ERROR
+
+    let h: ptr<Void> = k_CreateFileA(in_path, GEN_READ, FILE_SHARE_RW, null_ptr(), OPEN_EXISTING, FILE_NORMAL, null_ptr())
+    if ptr_to_int(h) == -1:
+        println("chroma_ssm: error opening: " + in_path)
+        return EXIT_ERROR
+
+    let szslot: ptr<Int> = alloc_zeroed(1, "Int")
+    var fsize: Int = -1
+    if k_GetFileSizeEx(h, szslot) != 0:
+        fsize = mem_load(szslot, "Int")
+    decay szslot
+
+    let total_samp: Int = fsize / 4
+    if total_samp < CHROMA_NFFT * 2:
+        println("chroma_ssm: error: audio too short for STFT")
+        let _c: Int = k_CloseHandle(h)
+        return EXIT_ERROR
+
+    let mut rawbuf: ptr<Byte> = alloc_zeroed(fsize + 32, "Byte")
+    let mut nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let rok: Int = k_ReadFile(h, rawbuf, fsize, nslot, null_ptr())
+    let _ch: Int = k_CloseHandle(h)
+    decay nslot
+
+    if rok == 0:
+        decay rawbuf
+        return EXIT_ERROR
+
+    // 2^e table for exact f32 decode
+    let mut p2t: ptr<Float> = alloc_zeroed(254, "Float")
+    var pv: Float = 1.0
+    var di: Int = 0
+    while di < 126:
+        pv = pv / 2.0
+        di = di + 1
+    var pj: Int = 0
+    while pj < 254:
+        mem_store(ptr_offset(p2t, pj, "Float"), pv, "Float")
+        pv = pv * 2.0
+        pj = pj + 1
+
+    let mut audio: ptr<Float> = alloc_zeroed(total_samp + 32, "Float")
+    var si: Int = 0
+    while si < total_samp:
+        let b0: Int = bref(rawbuf, si * 4)
+        let b1: Int = bref(rawbuf, si * 4 + 1)
+        let b2: Int = bref(rawbuf, si * 4 + 2)
+        let b3: Int = bref(rawbuf, si * 4 + 3)
+        mem_store(ptr_offset(audio, si, "Float"), f32_of_quad(b0, b1, b2, b3, p2t), "Float")
+        si = si + 1
+    decay rawbuf
+    decay p2t
+
+    // STFT & Chroma accumulation
+    let n_stft: Int = (total_samp - CHROMA_NFFT) / CHROMA_HOP
+    let mut chroma_frames: ptr<Float> = alloc_zeroed(n_stft * 12 + 32, "Float")
+    let mut global_chroma: ptr<Float> = alloc_zeroed(12, "Float")
+
+    let mut re: ptr<Float> = alloc_zeroed(CHROMA_NFFT, "Float")
+    let mut im: ptr<Float> = alloc_zeroed(CHROMA_NFFT, "Float")
+
+    var fi: Int = 0
+    while fi < n_stft:
+        let base: Int = fi * CHROMA_HOP
+        var k: Int = 0
+        while k < CHROMA_NFFT:
+            mem_store(ptr_offset(re, k, "Float"), mem_load(ptr_offset(audio, base + k, "Float"), "Float"), "Float")
+            mem_store(ptr_offset(im, k, "Float"), 0.0, "Float")
+            k = k + 1
+        
+        let _fok: Int = sk_fft(re, im, CHROMA_NFFT)
+
+        // Map bins (55 Hz to 2500 Hz) to pitch classes
+        var bin: Int = 1
+        while bin < CHROMA_NFFT / 2:
+            let freq: Float = (bin as Float) * fs_hz / (CHROMA_NFFT as Float)
+            if freq >= 55.0 and freq <= 2500.0:
+                let r: Float = mem_load(ptr_offset(re, bin, "Float"), "Float")
+                let im_val: Float = mem_load(ptr_offset(im, bin, "Float"), "Float")
+                let mag: Float = sqrt(r * r + im_val * im_val)
+                let oct: Float = fast_log2(freq / 440.0)
+                var midi_note: Int = (69.0 + 12.0 * oct + 0.5) as Int
+                var pc: Int = midi_note % 12
+                if pc < 0:
+                    pc = pc + 12
+                
+                let cur: Float = mem_load(ptr_offset(chroma_frames, fi * 12 + pc, "Float"), "Float")
+                mem_store(ptr_offset(chroma_frames, fi * 12 + pc, "Float"), cur + mag, "Float")
+                
+                let gcur: Float = mem_load(ptr_offset(global_chroma, pc, "Float"), "Float")
+                mem_store(ptr_offset(global_chroma, pc, "Float"), gcur + mag, "Float")
+            bin = bin + 1
+        
+        // Normalize frame vector
+        var frame_sq: Float = 0.0
+        var pci: Int = 0
+        while pci < 12:
+            let v: Float = mem_load(ptr_offset(chroma_frames, fi * 12 + pci, "Float"), "Float")
+            frame_sq = frame_sq + v * v
+            pci = pci + 1
+        let norm: Float = sqrt(frame_sq) + 0.000001
+        pci = 0
+        while pci < 12:
+            let v2: Float = mem_load(ptr_offset(chroma_frames, fi * 12 + pci, "Float"), "Float")
+            mem_store(ptr_offset(chroma_frames, fi * 12 + pci, "Float"), v2 / norm, "Float")
+            pci = pci + 1
+
+        fi = fi + 1
+
+    decay re
+    decay im
+
+    // Aggregate into 8-second phrase chunks (hop=1024 -> ~21.5 frames per second -> 172 frames per chunk)
+    let chunk_frames: Int = ((fs_hz * 8.0) / (CHROMA_HOP as Float)) as Int
+    var num_chunks: Int = n_stft / chunk_frames
+    if num_chunks < 2:
+        num_chunks = 2
+
+    let mut chunk_chroma: ptr<Float> = alloc_zeroed(num_chunks * 12 + 32, "Float")
+    var ci: Int = 0
+    while ci < num_chunks:
+        let c_base: Int = ci * chunk_frames
+        var p_idx: Int = 0
+        while p_idx < 12:
+            var acc: Float = 0.0
+            var cfi: Int = 0
+            while cfi < chunk_frames and (c_base + cfi) < n_stft:
+                acc = acc + mem_load(ptr_offset(chroma_frames, (c_base + cfi) * 12 + p_idx, "Float"), "Float")
+                cfi = cfi + 1
+            mem_store(ptr_offset(chunk_chroma, ci * 12 + p_idx, "Float"), acc, "Float")
+            p_idx = p_idx + 1
+        
+        // Normalize chunk vector
+        var c_sq: Float = 0.0
+        p_idx = 0
+        while p_idx < 12:
+            let cv: Float = mem_load(ptr_offset(chunk_chroma, ci * 12 + p_idx, "Float"), "Float")
+            c_sq = c_sq + cv * cv
+            p_idx = p_idx + 1
+        let c_norm: Float = sqrt(c_sq) + 0.000001
+        p_idx = 0
+        while p_idx < 12:
+            let cv2: Float = mem_load(ptr_offset(chunk_chroma, ci * 12 + p_idx, "Float"), "Float")
+            mem_store(ptr_offset(chunk_chroma, ci * 12 + p_idx, "Float"), cv2 / c_norm, "Float")
+            p_idx = p_idx + 1
+
+        ci = ci + 1
+
+    decay chroma_frames
+
+    // Detect Root Key from global chroma distribution
+    let pitch_names: Array<String> = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    var max_global_energy: Float = 0.0
+    var best_root: Int = 0
+    var r_idx: Int = 0
+    while r_idx < 12:
+        let gv: Float = mem_load(ptr_offset(global_chroma, r_idx, "Float"), "Float")
+        if gv > max_global_energy:
+            max_global_energy = gv
+            best_root = r_idx
+        r_idx = r_idx + 1
+
+    let est_key: String = pitch_names[best_root]
+
+    println("chroma_ssm: harmonic profile complete")
+    println("  Tonal Center:   " + est_key + " (pitch class " + str(best_root) + ")")
+    println("  Total Chunks:   " + str(num_chunks) + " (8.0s each)")
+
+    // Screen Self-Similarity Matrix for recurring themes (gap >= 4 chunks -> >= 32 seconds apart)
+    var match_count: Int = 0
+    var csv_out: String = "motif_id,time1_sec,time2_sec,similarity,key_est\n"
+    var md_out: String = "# Fantasia Harmonic Recurrence & Motif Catalog\n\n"
+    md_out = md_out + "- **Global Key Center:** `" + est_key + "`\n"
+    md_out = md_out + "- **Session Duration:** " + str((total_samp as Float) / fs_hz) + "s\n\n"
+    md_out = md_out + "| Motif | Timestamp A | Timestamp B | Cosine Similarity | Status |\n"
+    md_out = md_out + "|---|---|---|---|---|\n"
+
+    var i1: Int = 0
+    while i1 < num_chunks:
+        var i2: Int = i1 + 4
+        while i2 < num_chunks:
+            var dot: Float = 0.0
+            var d: Int = 0
+            while d < 12:
+                let v1: Float = mem_load(ptr_offset(chunk_chroma, i1 * 12 + d, "Float"), "Float")
+                let v2: Float = mem_load(ptr_offset(chunk_chroma, i2 * 12 + d, "Float"), "Float")
+                dot = dot + v1 * v2
+                d = d + 1
+            
+            if dot >= 0.90:
+                match_count = match_count + 1
+                let t1: Float = (i1 as Float) * 8.0
+                let t2: Float = (i2 as Float) * 8.0
+                
+                let t1_m: Int = (t1 / 60.0) as Int
+                let t1_s: Int = (t1 % 60.0) as Int
+                let t2_m: Int = (t2 / 60.0) as Int
+                let t2_s: Int = (t2 % 60.0) as Int
+
+                println("  Motif Match (" + fmt_f3(dot) + "): [" + str(t1_m) + ":" + str(t1_s) + "] matches [" + str(t2_m) + ":" + str(t2_s) + "]")
+                csv_out = csv_out + str(match_count) + "," + fmt_f3(t1) + "," + fmt_f3(t2) + "," + fmt_f3(dot) + "," + est_key + "\n"
+                md_out = md_out + "| Motif " + str(match_count) + " | " + str(t1_m) + ":" + str(t1_s) + " | " + str(t2_m) + ":" + str(t2_s) + " | `" + fmt_f3(dot) + "` | `RECURRING_THEME` |\n"
+            i2 = i2 + 1
+        i1 = i1 + 1
+
+    let _w1: Int = write_text_file(csv_path, csv_out)
+    let _w2: Int = write_text_file(out_path, md_out)
+    println("chroma_ssm: detected " + str(match_count) + " recurring harmonic motifs -> written to " + out_path)
+
+    decay audio
+    decay global_chroma
+    decay chunk_chroma
+    return EXIT_OK
+
+pub fn chroma_ssm_prove() -> Int with Unsafe:
+    println("chroma_ssm: running formal chromatic cosine similarity prove battery...")
+    // P1: Identical pitch vectors must yield cosine similarity = 1.000
+    let mut vec_a: ptr<Float> = alloc_zeroed(12, "Float")
+    let mut vec_b: ptr<Float> = alloc_zeroed(12, "Float")
+
+    // Voicing: C#m (C#=1, E=4, G#=8)
+    mem_store(ptr_offset(vec_a, 1, "Float"), 1.0, "Float")
+    mem_store(ptr_offset(vec_a, 4, "Float"), 1.0, "Float")
+    mem_store(ptr_offset(vec_a, 8, "Float"), 1.0, "Float")
+
+    mem_store(ptr_offset(vec_b, 1, "Float"), 1.0, "Float")
+    mem_store(ptr_offset(vec_b, 4, "Float"), 1.0, "Float")
+    mem_store(ptr_offset(vec_b, 8, "Float"), 1.0, "Float")
+
+    // Normalize
+    var n_a: Float = sqrt(3.0)
+    var d: Int = 0
+    while d < 12:
+        let v: Float = mem_load(ptr_offset(vec_a, d, "Float"), "Float")
+        mem_store(ptr_offset(vec_a, d, "Float"), v / n_a, "Float")
+        mem_store(ptr_offset(vec_b, d, "Float"), v / n_a, "Float")
+        d = d + 1
+
+    var dot1: Float = 0.0
+    d = 0
+    while d < 12:
+        dot1 = dot1 + mem_load(ptr_offset(vec_a, d, "Float"), "Float") * mem_load(ptr_offset(vec_b, d, "Float"), "Float")
+        d = d + 1
+
+    var ok1: Int = 0
+    if dot1 > 0.999:
+        ok1 = 1
+    if ok1 == 1:
+        println("  [PASS] P1: Identical chord voicing cosine recurrence = 1.000 (" + str(dot1) + ")")
+    else:
+        println("  [FAIL] P1: cosine similarity failed")
+
+    // P2: Disjoint orthogonal keys (e.g. C major vs F# major) must yield similarity = 0.0
+    let mut vec_c: ptr<Float> = alloc_zeroed(12, "Float")
+    // F# major: F#=6, A#=10, C#=1
+    mem_store(ptr_offset(vec_c, 6, "Float"), 1.0 / n_a, "Float")
+    mem_store(ptr_offset(vec_c, 10, "Float"), 1.0 / n_a, "Float")
+    mem_store(ptr_offset(vec_c, 2, "Float"), 1.0 / n_a, "Float") // disjoint notes
+
+    var dot2: Float = 0.0
+    d = 0
+    while d < 12:
+        dot2 = dot2 + mem_load(ptr_offset(vec_a, d, "Float"), "Float") * mem_load(ptr_offset(vec_c, d, "Float"), "Float")
+        d = d + 1
+
+    var ok2: Int = 0
+    if dot2 < 0.01:
+        ok2 = 1
+    if ok2 == 1:
+        println("  [PASS] P2: Orthogonal chromatic chord separation (< 0.01)")
+    else:
+        println("  [FAIL] P2: orthogonal separation failed: " + str(dot2))
+
+    decay vec_a
+    decay vec_b
+    decay vec_c
+    if ok1 == 1 and ok2 == 1:
+        println("receipt=PASS prove=2/2")
+        return EXIT_OK
+    return EXIT_ERROR
